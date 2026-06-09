@@ -1,0 +1,146 @@
+name: WebView APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: 'URL website yang akan dibungkus menjadi APK WebView'
+        required: true
+        type: string
+      app_name:
+        description: 'Nama aplikasi APK'
+        required: false
+        default: 'MyWebApp'
+        type: string
+      build_mode:
+        description: 'Build mode (release atau debug)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      run_id_ref:
+        description: 'Referensi unik untuk tracking'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Generate Flutter WebView project
+        run: |
+          flutter create --org com.webview.app webview_app
+          cd webview_app
+          flutter pub add webview_flutter
+
+      - name: Inject WebURL into Flutter project
+        run: |
+          WEB_URL="${{ github.event.inputs.web_url }}"
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          APP_NAME="${APP_NAME:-MyWebApp}"
+
+          cat > webview_app/lib/main.dart << DARTEOF
+import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '$APP_NAME',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const WebViewPage(),
+    );
+  }
+}
+
+class WebViewPage extends StatefulWidget {
+  const WebViewPage({super.key});
+  @override
+  State<WebViewPage> createState() => _WebViewPageState();
+}
+
+class _WebViewPageState extends State<WebViewPage> {
+  late final WebViewController _controller;
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..loadRequest(Uri.parse('$WEB_URL'));
+  }
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: WebViewWidget(controller: _controller),
+    );
+  }
+}
+DARTEOF
+
+      - name: Update AndroidManifest for internet permission
+        run: |
+          MANIFEST="webview_app/android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "INTERNET" "$MANIFEST"; then
+            sed -i 's/<manifest/<manifest xmlns:android="http:\/\/schemas.android.com\/apk\/res\/android"/' "$MANIFEST" || true
+            sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>
+    <application/' "$MANIFEST"
+          fi
+
+      - name: Build APK (${{ github.event.inputs.build_mode }})
+        working-directory: webview_app
+        run: |
+          if [ "${{ github.event.inputs.build_mode }}" = "release" ]; then
+            flutter build apk --release --no-shrink
+          else
+            flutter build apk --debug
+          fi
+
+      - name: Locate and rename APK
+        run: |
+          APK_PATH=$(find webview_app/build/app/outputs -name "*.apk" | head -1)
+          mkdir -p artifacts
+          cp "$APK_PATH" artifacts/webview-${{ github.event.inputs.build_mode }}.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webview-apk-${{ github.event.inputs.build_mode }}-${{ github.run_id }}
+          path: artifacts/webview-${{ github.event.inputs.build_mode }}.apk
+          retention-days: 3
