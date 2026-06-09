@@ -1,0 +1,105 @@
+name: Flutter APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_download_url:
+        description: 'URL download file ZIP Flutter project'
+        required: true
+        type: string
+      build_mode:
+        description: 'Build mode (release atau debug)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      run_id_ref:
+        description: 'Referensi unik untuk tracking'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Download Flutter project ZIP
+        run: |
+          echo "Downloading project ZIP..."
+          curl -L -o project.zip "${{ github.event.inputs.zip_download_url }}"
+          echo "ZIP downloaded. Size:"
+          du -sh project.zip
+
+      - name: Extract Flutter project
+        run: |
+          mkdir -p flutter_project
+          unzip -o project.zip -d flutter_project_raw
+          SUBDIR=$(find flutter_project_raw -maxdepth 1 -mindepth 1 -type d | head -1)
+          if [ -n "$SUBDIR" ] && [ -f "$SUBDIR/pubspec.yaml" ]; then
+            cp -r "$SUBDIR/." flutter_project/
+          elif [ -f "flutter_project_raw/pubspec.yaml" ]; then
+            cp -r flutter_project_raw/. flutter_project/
+          else
+            echo "ERROR: pubspec.yaml tidak ditemukan dalam ZIP"
+            exit 1
+          fi
+
+      - name: Install Flutter dependencies
+        working-directory: flutter_project
+        run: flutter pub get
+
+      - name: Build APK (${{ github.event.inputs.build_mode }})
+        working-directory: flutter_project
+        run: |
+          if [ "${{ github.event.inputs.build_mode }}" = "release" ]; then
+            flutter build apk --release --no-shrink
+          else
+            flutter build apk --debug
+          fi
+
+      - name: Locate and rename APK
+        run: |
+          APK_PATH=$(find flutter_project/build/app/outputs -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build"
+            exit 1
+          fi
+          mkdir -p artifacts
+          cp "$APK_PATH" artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
+          echo "APK size: $(du -sh artifacts/*.apk)"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk-${{ github.event.inputs.build_mode }}-${{ github.run_id }}
+          path: artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
+          retention-days: 3
