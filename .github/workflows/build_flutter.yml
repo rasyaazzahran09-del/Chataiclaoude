@@ -58,7 +58,6 @@ jobs:
           yes | sdkmanager --licenses 2>/dev/null || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>/dev/null || true
 
-      # FIX 5: Tambah Authorization header untuk private repo release assets
       - name: Download Flutter project ZIP
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,117 +80,71 @@ jobs:
       - name: Extract Flutter project
         run: |
           mkdir -p flutter_project
-          unzip -o project.zip -d flutter_project_raw
-          SUBDIR=$(find flutter_project_raw -maxdepth 3 -name "pubspec.yaml" | head -1 | xargs dirname 2>/dev/null)
-          if [ -n "$SUBDIR" ]; then
-            cp -r "$SUBDIR/." flutter_project/
-            echo "Project ditemukan di: $SUBDIR"
+          unzip -q project.zip -d flutter_project_tmp
+          # Handle nested folder jika ada
+          INNER=$(ls flutter_project_tmp)
+          INNER_COUNT=$(ls flutter_project_tmp | wc -l)
+          if [ "$INNER_COUNT" -eq 1 ] && [ -d "flutter_project_tmp/$INNER" ]; then
+            mv "flutter_project_tmp/$INNER"/* flutter_project/ 2>/dev/null || true
+            mv "flutter_project_tmp/$INNER"/.[!.]* flutter_project/ 2>/dev/null || true
           else
-            echo "ERROR: pubspec.yaml tidak ditemukan"
-            find flutter_project_raw -type f | head -20
-            exit 1
+            mv flutter_project_tmp/* flutter_project/ 2>/dev/null || true
           fi
-          echo "=== pubspec.yaml ==="
-          cat flutter_project/pubspec.yaml
+          rm -rf flutter_project_tmp project.zip
+          ls flutter_project/
 
-      # ── PATCH android/app/build.gradle ──────────────────────────────────
-      - name: Patch android/app/build.gradle
+      - name: Disable minify and shrink resources
         run: |
           GRADLE="flutter_project/android/app/build.gradle"
-          if [ ! -f "$GRADLE" ]; then
-            echo "build.gradle tidak ditemukan, skip patch"
-            exit 0
+          if [ -f "$GRADLE" ]; then
+            sed -i 's/minifyEnabled true/minifyEnabled false/g' "$GRADLE"
+            sed -i 's/shrinkResources true/shrinkResources false/g' "$GRADLE"
+            echo "=== build.gradle after minify patch ==="
+            cat "$GRADLE"
           fi
-          echo "=== build.gradle SEBELUM patch ==="
-          cat "$GRADLE"
 
-          # Fix minSdkVersion → minimal 21
-          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 21/' "$GRADLE"
-          sed -i 's/minSdk [0-9]*/minSdk 21/' "$GRADLE"
-
-          # Fix compileSdkVersion → 34
-          sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/' "$GRADLE"
-          sed -i 's/compileSdk [0-9]*/compileSdk 34/' "$GRADLE"
-
-          # Fix targetSdkVersion → 34
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' "$GRADLE"
-          sed -i 's/targetSdk [0-9]*/targetSdk 34/' "$GRADLE"
-
-          # Tambah multiDexEnabled jika belum ada
-          grep -q "multiDexEnabled" "$GRADLE" || sed -i '/defaultConfig {/a\            multiDexEnabled true' "$GRADLE"
-
-          # FIX 2: Disable minifyEnabled & shrinkResources di release buildType
-          # R8/ProGuard sering crash tanpa proguard rules yang benar
-          sed -i '/buildTypes/,/^    }/{
-            /release/,/}/{
-              s/minifyEnabled true/minifyEnabled false/g
-              s/shrinkResources true/shrinkResources false/g
-            }
-          }' "$GRADLE" || true
-
-          echo "=== build.gradle SETELAH patch ==="
-          cat "$GRADLE"
-
-      # FIX 1: Selalu generate keystore otomatis + patch signingConfig LENGKAP
       - name: Fix signing config for release
         run: |
           GRADLE="flutter_project/android/app/build.gradle"
           BUILD_MODE="${{ github.event.inputs.build_mode }}"
 
-          # Selalu generate debug keystore untuk dipakai saat build
-          # (Flutter uses $HOME/.android/debug.keystore by default, pastikan ada)
           KEYSTORE_DIR="$HOME/.android"
           mkdir -p "$KEYSTORE_DIR"
           if [ ! -f "$KEYSTORE_DIR/debug.keystore" ]; then
-            echo "Generating debug keystore..."
             keytool -genkeypair -v \
               -keystore "$KEYSTORE_DIR/debug.keystore" \
               -alias androiddebugkey \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass android -keypass android \
               -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null
-            echo "Debug keystore generated."
           fi
 
-          # Juga generate release keystore di folder project
           RELEASE_JKS="flutter_project/android/app/release.jks"
           if [ ! -f "$RELEASE_JKS" ]; then
-            echo "Generating release keystore..."
             keytool -genkeypair -v \
               -keystore "$RELEASE_JKS" \
               -alias release \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass android -keypass android \
               -dname "CN=FlutterBot,O=FlutterBot,C=ID" 2>/dev/null
-            echo "Release keystore generated: $RELEASE_JKS"
+            echo "Release keystore generated."
           fi
 
-          # Cek apakah build.gradle punya signingConfigs block
           if grep -q "signingConfigs" "$GRADLE" 2>/dev/null; then
-            echo "signingConfigs ditemukan, patch path keystore..."
-            # Patch storeFile ke release.jks yang sudah kita generate
             sed -i 's|storeFile file("[^"]*")|storeFile file("release.jks")|g' "$GRADLE"
             sed -i 's|storePassword "[^"]*"|storePassword "android"|g' "$GRADLE"
             sed -i 's|keyAlias "[^"]*"|keyAlias "release"|g' "$GRADLE"
             sed -i 's|keyPassword "[^"]*"|keyPassword "android"|g' "$GRADLE"
             echo "Signing config patched."
           else
-            echo "Tidak ada custom signingConfig."
-            # Untuk release build, inject signingConfigs yang valid
             if [ "$BUILD_MODE" = "release" ]; then
-              echo "Injecting signingConfigs untuk release build..."
-              # Cari baris 'android {' dan inject signingConfigs setelah defaultConfig block
               python3 - << 'PYEOF'
 import re, sys
-
 with open('flutter_project/android/app/build.gradle', 'r') as f:
     content = f.read()
-
-# Cek apakah signingConfigs sudah ada
 if 'signingConfigs' in content:
     print("signingConfigs already exists, skip inject")
     sys.exit(0)
-
 signing_block = """
     signingConfigs {
         release {
@@ -202,33 +155,23 @@ signing_block = """
         }
     }
 """
-
 release_signing = """
             signingConfig signingConfigs.release
 """
-
-# Inject signingConfigs sebelum buildTypes
 content = content.replace('    buildTypes {', signing_block + '    buildTypes {', 1)
-
-# Inject signingConfig di release buildType
-# Cari 'release {' di dalam buildTypes dan tambah signingConfig
 def inject_signing(m):
     inner = m.group(0)
     if 'signingConfig' not in inner:
         inner = inner.rstrip('}').rstrip() + '\n' + release_signing + '        }\n'
     return inner
-
 content = re.sub(r'release \{[^}]*\}', inject_signing, content, count=1)
-
 with open('flutter_project/android/app/build.gradle', 'w') as f:
     f.write(content)
-
 print("signingConfigs injected successfully")
 PYEOF
             fi
           fi
 
-      # FIX 3: Tambah proguard-rules.pro yang aman
       - name: Write proguard-rules.pro
         run: |
           PROGUARD="flutter_project/android/app/proguard-rules.pro"
@@ -242,36 +185,24 @@ PYEOF
 -keepattributes *Annotation*
 -keepattributes SourceFile,LineNumberTable
 -keep public class * extends java.lang.Exception
-# Keep all classes (safe fallback)
 -keep class ** { *; }
 -dontwarn **
 EOF
-            echo "proguard-rules.pro created."
           else
-            # Tambah keep rules ke proguard yang sudah ada
             echo "" >> "$PROGUARD"
             echo "-keep class ** { *; }" >> "$PROGUARD"
             echo "-dontwarn **" >> "$PROGUARD"
-            echo "proguard-rules.pro updated with keep rules."
           fi
 
-      # FIX 6: Patch gradle wrapper ke versi yang kompatibel dengan JDK 17
       - name: Patch gradle wrapper version
         run: |
           WRAPPER="flutter_project/android/gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$WRAPPER" ]; then
-            echo "=== gradle-wrapper.properties ==="
-            cat "$WRAPPER"
-            # Cek versi gradle, kalau < 7.6 patch ke 8.10.2
-            CURRENT=$(grep distributionUrl "$WRAPPER" | grep -oP 'gradle-\K[0-9.]+(?=-)')
-            echo "Current Gradle version: $CURRENT"
-            # Patch ke Gradle 8.10.2 yang stable dengan JDK 17
             sed -i 's|distributionUrl=.*|distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip|' "$WRAPPER"
             echo "Patched to Gradle 8.10.2"
             cat "$WRAPPER"
           fi
 
-      # ── local.properties & gradle.properties ────────────────────────────
       - name: Write local.properties
         run: |
           FLUTTER_SDK=$(which flutter | sed 's|/bin/flutter||')
@@ -284,12 +215,11 @@ EOF
         run: |
           GP="flutter_project/android/gradle.properties"
           touch "$GP"
-          grep -q "org.gradle.jvmargs"    "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
-          grep -q "android.useAndroidX"   "$GP" || echo "android.useAndroidX=true"   >> "$GP"
-          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
-          grep -q "org.gradle.parallel"   "$GP" || echo "org.gradle.parallel=true"   >> "$GP"
-          grep -q "org.gradle.caching"    "$GP" || echo "org.gradle.caching=true"    >> "$GP"
-          # FIX: Disable R8 full mode yang sering crash
+          grep -q "org.gradle.jvmargs"      "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
+          grep -q "android.useAndroidX"     "$GP" || echo "android.useAndroidX=true"    >> "$GP"
+          grep -q "android.enableJetifier"  "$GP" || echo "android.enableJetifier=true" >> "$GP"
+          grep -q "org.gradle.parallel"     "$GP" || echo "org.gradle.parallel=true"    >> "$GP"
+          grep -q "org.gradle.caching"      "$GP" || echo "org.gradle.caching=true"     >> "$GP"
           grep -q "android.enableR8.fullMode" "$GP" || echo "android.enableR8.fullMode=false" >> "$GP"
           cat "$GP"
 
@@ -304,13 +234,10 @@ EOF
         working-directory: flutter_project
         run: flutter pub get
 
-      # ── Analyze dulu sebelum build — tangkap Dart error lebih awal ───────
       - name: Flutter analyze (non-fatal)
         working-directory: flutter_project
         run: flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 || true
 
-      # ── BUILD UTAMA ───────────────────────────────────────────────────────
-      # FIX 7: set -o pipefail supaya PIPESTATUS benar
       - name: Build APK (${{ github.event.inputs.build_mode }})
         working-directory: flutter_project
         timeout-minutes: 40
@@ -318,29 +245,16 @@ EOF
           set -o pipefail
           BUILD_MODE="${{ github.event.inputs.build_mode }}"
           echo "=== BUILD START: $BUILD_MODE ==="
-
           if [ "$BUILD_MODE" = "release" ]; then
-            flutter build apk --release \
-              --no-tree-shake-icons \
-              --verbose \
-              2>&1 | tee /tmp/flutter_build.log
+            flutter build apk --release --no-tree-shake-icons --verbose 2>&1 | tee /tmp/flutter_build.log
           else
-            flutter build apk --debug \
-              --no-tree-shake-icons \
-              --verbose \
-              2>&1 | tee /tmp/flutter_build.log
+            flutter build apk --debug --no-tree-shake-icons --verbose 2>&1 | tee /tmp/flutter_build.log
           fi
-
           BUILD_EXIT=$?
           if [ $BUILD_EXIT -ne 0 ]; then
-            echo ""
-            echo "════════════════════════════════════════"
-            echo "  BUILD GAGAL — log error lengkap:"
-            echo "════════════════════════════════════════"
+            echo "════ BUILD GAGAL — error log:"
             grep -E "(Error|error|Exception|FAILED|lib/)" /tmp/flutter_build.log | tail -50 || true
-            echo "────────────────────────────────────────"
-            echo "  50 baris terakhir log:"
-            echo "────────────────────────────────────────"
+            echo "════ 50 baris terakhir:"
             tail -50 /tmp/flutter_build.log
             exit 1
           fi
@@ -355,7 +269,7 @@ EOF
           fi
           mkdir -p artifacts
           cp "$APK" artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
-          echo "✅ APK siap: $(du -sh artifacts/*.apk)"
+          echo "APK siap: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4.6.2
