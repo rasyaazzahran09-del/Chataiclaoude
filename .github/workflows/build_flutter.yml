@@ -24,19 +24,21 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Setup Java JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v4.7.0
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Setup Flutter SDK
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2.14.0
         with:
           flutter-version: '3.27.4'
           channel: 'stable'
@@ -56,15 +58,24 @@ jobs:
           yes | sdkmanager --licenses 2>/dev/null || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>/dev/null || true
 
+      # FIX 5: Tambah Authorization header untuk private repo release assets
       - name: Download Flutter project ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Downloading ZIP..."
           for i in 1 2 3; do
             curl -fL --retry 3 --retry-delay 10 --max-time 600 \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
               -o project.zip "${{ github.event.inputs.zip_download_url }}" && break
             echo "Attempt $i gagal, retry in 10s..."
             sleep 10
           done
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            echo "ERROR: ZIP download gagal atau file kosong"
+            exit 1
+          fi
           du -sh project.zip
 
       - name: Extract Flutter project
@@ -84,7 +95,6 @@ jobs:
           cat flutter_project/pubspec.yaml
 
       # ── PATCH android/app/build.gradle ──────────────────────────────────
-      # Fix: minSdk, compileSdk, multiDex, hapus signing config yang rusak
       - name: Patch android/app/build.gradle
         run: |
           GRADLE="flutter_project/android/app/build.gradle"
@@ -110,40 +120,155 @@ jobs:
           # Tambah multiDexEnabled jika belum ada
           grep -q "multiDexEnabled" "$GRADLE" || sed -i '/defaultConfig {/a\            multiDexEnabled true' "$GRADLE"
 
+          # FIX 2: Disable minifyEnabled & shrinkResources di release buildType
+          # R8/ProGuard sering crash tanpa proguard rules yang benar
+          sed -i '/buildTypes/,/^    }/{
+            /release/,/}/{
+              s/minifyEnabled true/minifyEnabled false/g
+              s/shrinkResources true/shrinkResources false/g
+            }
+          }' "$GRADLE" || true
+
           echo "=== build.gradle SETELAH patch ==="
           cat "$GRADLE"
 
-      # ── PATCH: Hapus / nonaktifkan signing config release yang rusak ──────
-      # Kalau project pakai signingConfigs tapi .jks tidak ada → auto crash
+      # FIX 1: Selalu generate keystore otomatis + patch signingConfig LENGKAP
       - name: Fix signing config for release
         run: |
           GRADLE="flutter_project/android/app/build.gradle"
           BUILD_MODE="${{ github.event.inputs.build_mode }}"
 
-          # Generate keystore debug sederhana untuk release jika tidak ada keystore
-          if grep -q "storeFile" "$GRADLE" 2>/dev/null; then
-            # Ada signing config — cek apakah .jks/.keystore ada
-            JKS=$(grep -o 'storeFile file("[^"]*")' "$GRADLE" | grep -o '"[^"]*"' | tr -d '"' | head -1)
-            FULL_JKS="flutter_project/android/app/$JKS"
-            if [ ! -f "$FULL_JKS" ] && [ ! -f "$JKS" ]; then
-              echo "Keystore '$JKS' tidak ditemukan, generate keystore otomatis..."
-              keytool -genkeypair -v \
-                -keystore flutter_project/android/app/release.jks \
-                -alias release \
-                -keyalg RSA -keysize 2048 -validity 10000 \
-                -storepass android -keypass android \
-                -dname "CN=FlutterBot,O=FlutterBot,C=ID" 2>/dev/null
-              # Patch gradle pakai keystore baru
-              sed -i 's|storeFile file("[^"]*")|storeFile file("release.jks")|g' "$GRADLE"
-              sed -i 's|storePassword "[^"]*"|storePassword "android"|g' "$GRADLE"
-              sed -i 's|keyAlias "[^"]*"|keyAlias "release"|g' "$GRADLE"
-              sed -i 's|keyPassword "[^"]*"|keyPassword "android"|g' "$GRADLE"
-              echo "Keystore otomatis di-generate: release.jks"
-            else
-              echo "Keystore ditemukan: $JKS"
-            fi
+          # Selalu generate debug keystore untuk dipakai saat build
+          # (Flutter uses $HOME/.android/debug.keystore by default, pastikan ada)
+          KEYSTORE_DIR="$HOME/.android"
+          mkdir -p "$KEYSTORE_DIR"
+          if [ ! -f "$KEYSTORE_DIR/debug.keystore" ]; then
+            echo "Generating debug keystore..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_DIR/debug.keystore" \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null
+            echo "Debug keystore generated."
+          fi
+
+          # Juga generate release keystore di folder project
+          RELEASE_JKS="flutter_project/android/app/release.jks"
+          if [ ! -f "$RELEASE_JKS" ]; then
+            echo "Generating release keystore..."
+            keytool -genkeypair -v \
+              -keystore "$RELEASE_JKS" \
+              -alias release \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=FlutterBot,O=FlutterBot,C=ID" 2>/dev/null
+            echo "Release keystore generated: $RELEASE_JKS"
+          fi
+
+          # Cek apakah build.gradle punya signingConfigs block
+          if grep -q "signingConfigs" "$GRADLE" 2>/dev/null; then
+            echo "signingConfigs ditemukan, patch path keystore..."
+            # Patch storeFile ke release.jks yang sudah kita generate
+            sed -i 's|storeFile file("[^"]*")|storeFile file("release.jks")|g' "$GRADLE"
+            sed -i 's|storePassword "[^"]*"|storePassword "android"|g' "$GRADLE"
+            sed -i 's|keyAlias "[^"]*"|keyAlias "release"|g' "$GRADLE"
+            sed -i 's|keyPassword "[^"]*"|keyPassword "android"|g' "$GRADLE"
+            echo "Signing config patched."
           else
-            echo "Tidak ada custom signingConfig, aman untuk build"
+            echo "Tidak ada custom signingConfig."
+            # Untuk release build, inject signingConfigs yang valid
+            if [ "$BUILD_MODE" = "release" ]; then
+              echo "Injecting signingConfigs untuk release build..."
+              # Cari baris 'android {' dan inject signingConfigs setelah defaultConfig block
+              python3 - << 'PYEOF'
+import re, sys
+
+with open('flutter_project/android/app/build.gradle', 'r') as f:
+    content = f.read()
+
+# Cek apakah signingConfigs sudah ada
+if 'signingConfigs' in content:
+    print("signingConfigs already exists, skip inject")
+    sys.exit(0)
+
+signing_block = """
+    signingConfigs {
+        release {
+            storeFile file("release.jks")
+            storePassword "android"
+            keyAlias "release"
+            keyPassword "android"
+        }
+    }
+"""
+
+release_signing = """
+            signingConfig signingConfigs.release
+"""
+
+# Inject signingConfigs sebelum buildTypes
+content = content.replace('    buildTypes {', signing_block + '    buildTypes {', 1)
+
+# Inject signingConfig di release buildType
+# Cari 'release {' di dalam buildTypes dan tambah signingConfig
+def inject_signing(m):
+    inner = m.group(0)
+    if 'signingConfig' not in inner:
+        inner = inner.rstrip('}').rstrip() + '\n' + release_signing + '        }\n'
+    return inner
+
+content = re.sub(r'release \{[^}]*\}', inject_signing, content, count=1)
+
+with open('flutter_project/android/app/build.gradle', 'w') as f:
+    f.write(content)
+
+print("signingConfigs injected successfully")
+PYEOF
+            fi
+          fi
+
+      # FIX 3: Tambah proguard-rules.pro yang aman
+      - name: Write proguard-rules.pro
+        run: |
+          PROGUARD="flutter_project/android/app/proguard-rules.pro"
+          if [ ! -f "$PROGUARD" ]; then
+            cat > "$PROGUARD" << 'EOF'
+# Keep all Flutter & Dart classes
+-keep class io.flutter.** { *; }
+-keep class io.flutter.plugins.** { *; }
+-keep class io.flutter.embedding.** { *; }
+-dontwarn io.flutter.**
+-keepattributes *Annotation*
+-keepattributes SourceFile,LineNumberTable
+-keep public class * extends java.lang.Exception
+# Keep all classes (safe fallback)
+-keep class ** { *; }
+-dontwarn **
+EOF
+            echo "proguard-rules.pro created."
+          else
+            # Tambah keep rules ke proguard yang sudah ada
+            echo "" >> "$PROGUARD"
+            echo "-keep class ** { *; }" >> "$PROGUARD"
+            echo "-dontwarn **" >> "$PROGUARD"
+            echo "proguard-rules.pro updated with keep rules."
+          fi
+
+      # FIX 6: Patch gradle wrapper ke versi yang kompatibel dengan JDK 17
+      - name: Patch gradle wrapper version
+        run: |
+          WRAPPER="flutter_project/android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER" ]; then
+            echo "=== gradle-wrapper.properties ==="
+            cat "$WRAPPER"
+            # Cek versi gradle, kalau < 7.6 patch ke 8.10.2
+            CURRENT=$(grep distributionUrl "$WRAPPER" | grep -oP 'gradle-\K[0-9.]+(?=-)')
+            echo "Current Gradle version: $CURRENT"
+            # Patch ke Gradle 8.10.2 yang stable dengan JDK 17
+            sed -i 's|distributionUrl=.*|distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip|' "$WRAPPER"
+            echo "Patched to Gradle 8.10.2"
+            cat "$WRAPPER"
           fi
 
       # ── local.properties & gradle.properties ────────────────────────────
@@ -164,10 +289,12 @@ jobs:
           grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
           grep -q "org.gradle.parallel"   "$GP" || echo "org.gradle.parallel=true"   >> "$GP"
           grep -q "org.gradle.caching"    "$GP" || echo "org.gradle.caching=true"    >> "$GP"
+          # FIX: Disable R8 full mode yang sering crash
+          grep -q "android.enableR8.fullMode" "$GP" || echo "android.enableR8.fullMode=false" >> "$GP"
           cat "$GP"
 
       - name: Cache Pub dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.0
         with:
           path: ~/.pub-cache
           key: pub-${{ hashFiles('flutter_project/pubspec.lock') }}
@@ -183,11 +310,12 @@ jobs:
         run: flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 || true
 
       # ── BUILD UTAMA ───────────────────────────────────────────────────────
-      # --verbose supaya log Dart error kelihatan jelas di GitHub Actions
+      # FIX 7: set -o pipefail supaya PIPESTATUS benar
       - name: Build APK (${{ github.event.inputs.build_mode }})
         working-directory: flutter_project
         timeout-minutes: 40
         run: |
+          set -o pipefail
           BUILD_MODE="${{ github.event.inputs.build_mode }}"
           echo "=== BUILD START: $BUILD_MODE ==="
 
@@ -203,13 +331,12 @@ jobs:
               2>&1 | tee /tmp/flutter_build.log
           fi
 
-          EXIT_CODE=${PIPESTATUS[0]}
-          if [ $EXIT_CODE -ne 0 ]; then
+          BUILD_EXIT=$?
+          if [ $BUILD_EXIT -ne 0 ]; then
             echo ""
             echo "════════════════════════════════════════"
             echo "  BUILD GAGAL — log error lengkap:"
             echo "════════════════════════════════════════"
-            # Tampilkan baris error Dart (lib/*.dart)
             grep -E "(Error|error|Exception|FAILED|lib/)" /tmp/flutter_build.log | tail -50 || true
             echo "────────────────────────────────────────"
             echo "  50 baris terakhir log:"
@@ -231,7 +358,7 @@ jobs:
           echo "✅ APK siap: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: flutter-apk-${{ github.event.inputs.build_mode }}-${{ github.run_id }}
           path: artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
