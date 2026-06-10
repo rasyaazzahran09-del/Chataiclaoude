@@ -12,6 +12,11 @@ on:
         required: false
         default: 'MyWebApp'
         type: string
+      app_icon_url:
+        description: 'URL gambar icon aplikasi (opsional, PNG/JPG)'
+        required: false
+        default: ''
+        type: string
       build_mode:
         description: 'Build mode (release atau debug)'
         required: true
@@ -57,20 +62,27 @@ jobs:
         run: |
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Install Python dependencies
+        run: pip install Pillow requests
+
       - name: Generate Flutter WebView project
         run: |
           flutter create --org com.webview.app webview_app
           cd webview_app
           flutter pub add webview_flutter
 
-      - name: Inject WebURL into Flutter project
+      - name: Inject WebView main.dart via Python
+        env:
+          WEB_URL: ${{ github.event.inputs.web_url }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
-          WEB_URL="${{ github.event.inputs.web_url }}"
-          APP_NAME="${{ github.event.inputs.app_name }}"
-          APP_NAME="${APP_NAME:-MyWebApp}"
+          python3 - << 'PYEOF'
+import os
 
-          cat > webview_app/lib/main.dart << DARTEOF
-import 'package:flutter/material.dart';
+web_url = os.environ.get('WEB_URL', 'https://example.com')
+app_name = os.environ.get('APP_NAME', 'MyWebApp') or 'MyWebApp'
+
+dart_code = """import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 void main() {
@@ -82,7 +94,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '$APP_NAME',
+      title: '""" + app_name + """',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(primarySwatch: Colors.blue),
       home: const WebViewPage(),
@@ -103,7 +115,7 @@ class _WebViewPageState extends State<WebViewPage> {
     super.initState();
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..loadRequest(Uri.parse('$WEB_URL'));
+      ..loadRequest(Uri.parse('""" + web_url + """'));
   }
   @override
   Widget build(BuildContext context) {
@@ -112,15 +124,71 @@ class _WebViewPageState extends State<WebViewPage> {
     );
   }
 }
-DARTEOF
+"""
 
-      - name: Update AndroidManifest for internet permission
+with open('webview_app/lib/main.dart', 'w') as f:
+    f.write(dart_code)
+print("main.dart generated for:", app_name, "->", web_url)
+PYEOF
+
+      - name: Set app name in pubspec.yaml
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
+          APP="${APP_NAME:-MyWebApp}"
+          sed -i "s/^name: .*/name: webview_app/" webview_app/pubspec.yaml
+          sed -i "s/^description: .*/description: $APP/" webview_app/pubspec.yaml
+
+      - name: Set app display name in AndroidManifest
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+        run: |
+          APP="${APP_NAME:-MyWebApp}"
           MANIFEST="webview_app/android/app/src/main/AndroidManifest.xml"
+          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP\"/" "$MANIFEST"
           if ! grep -q "INTERNET" "$MANIFEST"; then
-            sed -i 's/<manifest/<manifest xmlns:android="http:\/\/schemas.android.com\/apk\/res\/android"/' "$MANIFEST" || true
-            sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>
-    <application/' "$MANIFEST"
+            sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\'$'\n    <application/' "$MANIFEST"
+          fi
+
+      - name: Download and set custom app icon
+        env:
+          ICON_URL: ${{ github.event.inputs.app_icon_url }}
+        run: |
+          if [ -n "$ICON_URL" ]; then
+            python3 - << 'PYEOF'
+import os, sys, urllib.request
+from PIL import Image
+import io
+
+icon_url = os.environ.get('ICON_URL', '')
+if not icon_url:
+    sys.exit(0)
+
+sizes = {
+    'mipmap-mdpi': 48,
+    'mipmap-hdpi': 72,
+    'mipmap-xhdpi': 96,
+    'mipmap-xxhdpi': 144,
+    'mipmap-xxxhdpi': 192,
+}
+
+try:
+    req = urllib.request.urlopen(icon_url, timeout=30)
+    img_data = req.read()
+    img = Image.open(io.BytesIO(img_data)).convert('RGBA')
+    base = 'webview_app/android/app/src/main/res'
+    for folder, size in sizes.items():
+        out_dir = os.path.join(base, folder)
+        os.makedirs(out_dir, exist_ok=True)
+        resized = img.resize((size, size), Image.LANCZOS)
+        resized.save(os.path.join(out_dir, 'ic_launcher.png'), 'PNG')
+        print(f"Icon {size}x{size} saved to {folder}")
+    print("Custom icon applied successfully")
+except Exception as e:
+    print(f"Warning: Could not apply icon: {e}, using default")
+PYEOF
+          else
+            echo "No custom icon URL provided, using default Flutter icon"
           fi
 
       - name: Build APK (${{ github.event.inputs.build_mode }})
@@ -133,14 +201,22 @@ DARTEOF
           fi
 
       - name: Locate and rename APK
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
           APK_PATH=$(find webview_app/build/app/outputs -name "*.apk" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build"
+            exit 1
+          fi
           mkdir -p artifacts
-          cp "$APK_PATH" artifacts/webview-${{ github.event.inputs.build_mode }}.apk
+          SAFE_NAME=$(echo "${APP_NAME:-webview}" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          cp "$APK_PATH" "artifacts/${SAFE_NAME}-${{ github.event.inputs.build_mode }}.apk"
+          echo "APK size: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: webview-apk-${{ github.event.inputs.build_mode }}-${{ github.run_id }}
-          path: artifacts/webview-${{ github.event.inputs.build_mode }}.apk
+          path: artifacts/*.apk
           retention-days: 3
