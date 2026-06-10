@@ -29,19 +29,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # FIX: Hapus cache: gradle — menyebabkan crash di repo yang belum ada Gradle
       - name: Setup Java JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-
-      # FIX: Pastikan JAVA_HOME ter-set dengan benar
-      - name: Verify Java installation
-        run: |
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-          which java
 
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
@@ -51,73 +43,73 @@ jobs:
           cache: true
           cache-key: flutter-3.24.5-stable
 
-      - name: Verify Flutter installation
-        run: flutter --version
-
-      # FIX: Ganti android-actions/setup-android (sering error) dengan setup manual
+      # Setup Android SDK — pakai yang sudah ada di runner (lebih cepat & stabil)
       - name: Setup Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          if [ -z "$ANDROID_HOME" ] && [ -d "$HOME/android-sdk" ]; then
-            export ANDROID_HOME="$HOME/android-sdk"
-          fi
-          # Android SDK sudah tersedia di ubuntu-22.04 runner
-          sdkmanager --version || echo "sdkmanager not in PATH, searching..."
-          # Cari sdkmanager jika tidak di PATH
-          SDKMAN=$(find /usr/local/lib/android/sdk /home/runner /opt -name sdkmanager 2>/dev/null | head -1)
-          if [ -n "$SDKMAN" ]; then
-            export PATH="$(dirname $SDKMAN):$PATH"
-            echo "$(dirname $SDKMAN)" >> $GITHUB_PATH
-            echo "ANDROID_HOME=$(dirname $(dirname $(dirname $SDKMAN)))" >> $GITHUB_ENV
-          fi
+          ANDROID_SDK="/usr/local/lib/android/sdk"
+          echo "ANDROID_HOME=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "$ANDROID_SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_SDK/tools/bin" >> $GITHUB_PATH
 
-      - name: Accept Android licenses
+      - name: Accept Android licenses & install components
         run: |
-          yes | flutter doctor --android-licenses 2>/dev/null || true
           yes | sdkmanager --licenses 2>/dev/null || true
-
-      - name: Install Android build tools
-        run: |
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>/dev/null || true
-
-      - name: Flutter doctor
-        run: flutter doctor -v || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973" 2>/dev/null || true
+          flutter doctor --android-licenses 2>/dev/null || true
 
       - name: Download Flutter project ZIP
         run: |
-          echo "Downloading ZIP (retry 3x jika gagal)..."
+          echo "Downloading ZIP..."
           for i in 1 2 3; do
             curl -L --retry 3 --retry-delay 10 --max-time 600 \
               -o project.zip "${{ github.event.inputs.zip_download_url }}" && break
-            echo "Attempt $i failed, retrying..."
+            echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
-          echo "Download selesai. Ukuran:"
           du -sh project.zip
 
       - name: Extract Flutter project
         run: |
           mkdir -p flutter_project
           unzip -o project.zip -d flutter_project_raw
-          SUBDIR=$(find flutter_project_raw -maxdepth 1 -mindepth 1 -type d | head -1)
-          if [ -n "$SUBDIR" ] && [ -f "$SUBDIR/pubspec.yaml" ]; then
+          # Support: zip berisi folder, atau langsung file
+          SUBDIR=$(find flutter_project_raw -maxdepth 2 -name "pubspec.yaml" | head -1 | xargs dirname 2>/dev/null)
+          if [ -n "$SUBDIR" ]; then
             cp -r "$SUBDIR/." flutter_project/
-          elif [ -f "flutter_project_raw/pubspec.yaml" ]; then
-            cp -r flutter_project_raw/. flutter_project/
+            echo "Project ditemukan di: $SUBDIR"
           else
-            echo "ERROR: pubspec.yaml tidak ditemukan"
-            find flutter_project_raw -name "pubspec.yaml" | head -5
+            echo "ERROR: pubspec.yaml tidak ditemukan di ZIP"
+            find flutter_project_raw -type f | head -20
             exit 1
           fi
-          echo "=== pubspec.yaml ==="
-          head -20 flutter_project/pubspec.yaml
+          echo "=== pubspec.yaml (10 baris pertama) ==="
+          head -10 flutter_project/pubspec.yaml
+
+      # WAJIB: local.properties harus ada sebelum build
+      - name: Write local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > flutter_project/android/local.properties
+          echo "flutter.sdk=$(which flutter | sed 's|/bin/flutter||')" >> flutter_project/android/local.properties
+          echo "flutter.buildMode=${{ github.event.inputs.build_mode }}" >> flutter_project/android/local.properties
+          cat flutter_project/android/local.properties
+
+      # Gradle JVM heap fix — cegah OOM saat build
+      - name: Write gradle.properties
+        run: |
+          GRADLE_PROPS="flutter_project/android/gradle.properties"
+          # Tambahkan jika belum ada, jangan timpa yang sudah ada
+          touch "$GRADLE_PROPS"
+          grep -q "org.gradle.jvmargs" "$GRADLE_PROPS" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GRADLE_PROPS"
+          grep -q "android.useAndroidX" "$GRADLE_PROPS" || echo "android.useAndroidX=true" >> "$GRADLE_PROPS"
+          grep -q "android.enableJetifier" "$GRADLE_PROPS" || echo "android.enableJetifier=true" >> "$GRADLE_PROPS"
+          cat "$GRADLE_PROPS"
 
       - name: Cache Pub dependencies
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.pub-cache
+          path: ~/.pub-cache
           key: pub-${{ hashFiles('flutter_project/pubspec.lock') }}
           restore-keys: pub-
 
@@ -125,14 +117,26 @@ jobs:
         working-directory: flutter_project
         run: flutter pub get
 
+      - name: Flutter doctor (info)
+        run: flutter doctor || true
+
       - name: Build APK (${{ github.event.inputs.build_mode }})
+        id: build_apk
         working-directory: flutter_project
         timeout-minutes: 40
         run: |
-          if [ "${{ github.event.inputs.build_mode }}" = "release" ]; then
-            flutter build apk --release --no-shrink
+          BUILD_MODE="${{ github.event.inputs.build_mode }}"
+          echo "=== Mulai build mode: $BUILD_MODE ==="
+          if [ "$BUILD_MODE" = "release" ]; then
+            flutter build apk --release --no-tree-shake-icons 2>&1 | tee /tmp/build.log
           else
-            flutter build apk --debug
+            flutter build apk --debug --no-tree-shake-icons 2>&1 | tee /tmp/build.log
+          fi
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "=== BUILD GAGAL — 30 baris terakhir log ==="
+            tail -30 /tmp/build.log
+            exit 1
           fi
 
       - name: Locate and rename APK
@@ -140,12 +144,12 @@ jobs:
           APK=$(find flutter_project/build/app/outputs -name "*.apk" | head -1)
           if [ -z "$APK" ]; then
             echo "ERROR: APK tidak ditemukan"
-            find flutter_project/build -type f | head -20
+            find flutter_project/build -type f 2>/dev/null | head -20
             exit 1
           fi
           mkdir -p artifacts
           cp "$APK" artifacts/flutter-${{ github.event.inputs.build_mode }}.apk
-          echo "APK: $(du -sh artifacts/*.apk)"
+          echo "APK siap: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
