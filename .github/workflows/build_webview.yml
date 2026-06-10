@@ -130,13 +130,11 @@ PYEOF
           grep -q "INTERNET" "$MANIFEST" || \
             sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\'$'\n    <application/' "$MANIFEST"
 
-      # FIX: Patch gradle wrapper WebView project ke Gradle 8.10.2
       - name: Patch gradle wrapper version (WebView)
         run: |
           WRAPPER="webview_app/android/gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$WRAPPER" ]; then
             sed -i 's|distributionUrl=.*|distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip|' "$WRAPPER"
-            echo "Patched Gradle wrapper:"
             cat "$WRAPPER"
           fi
 
@@ -150,12 +148,11 @@ PYEOF
         run: |
           GP="webview_app/android/gradle.properties"
           touch "$GP"
-          grep -q "org.gradle.jvmargs"    "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
-          grep -q "android.useAndroidX"   "$GP" || echo "android.useAndroidX=true"   >> "$GP"
-          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+          grep -q "org.gradle.jvmargs"      "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
+          grep -q "android.useAndroidX"     "$GP" || echo "android.useAndroidX=true"    >> "$GP"
+          grep -q "android.enableJetifier"  "$GP" || echo "android.enableJetifier=true" >> "$GP"
           grep -q "android.enableR8.fullMode" "$GP" || echo "android.enableR8.fullMode=false" >> "$GP"
 
-      # FIX: Generate release keystore untuk WebView build
       - name: Generate release keystore (WebView)
         run: |
           RELEASE_JKS="webview_app/android/app/release.jks"
@@ -166,8 +163,6 @@ PYEOF
             -storepass android -keypass android \
             -dname "CN=FlutterBot,O=FlutterBot,C=ID" 2>/dev/null
           echo "Release keystore generated."
-
-          # Inject signingConfigs ke build.gradle WebView
           GRADLE="webview_app/android/app/build.gradle"
           if grep -q "signingConfigs" "$GRADLE" 2>/dev/null; then
             sed -i 's|storeFile file("[^"]*")|storeFile file("release.jks")|g' "$GRADLE"
@@ -219,7 +214,7 @@ PYEOF
           if [ "$BUILD_MODE" = "release" ]; then
             flutter build apk --release --no-tree-shake-icons --verbose 2>&1 | tee /tmp/wv_build.log
           else
-            flutter build apk --debug  --no-tree-shake-icons --verbose 2>&1 | tee /tmp/wv_build.log
+            flutter build apk --debug --no-tree-shake-icons --verbose 2>&1 | tee /tmp/wv_build.log
           fi
           BUILD_EXIT=$?
           if [ $BUILD_EXIT -ne 0 ]; then
@@ -238,7 +233,7 @@ PYEOF
           mkdir -p artifacts
           SAFE=$(echo "${APP_NAME:-webview}" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           cp "$APK" "artifacts/${SAFE}-${{ github.event.inputs.build_mode }}.apk"
-          echo "✅ APK: $(du -sh artifacts/*.apk)"
+          echo "APK: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4.6.2
