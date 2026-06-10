@@ -48,10 +48,10 @@ jobs:
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.5'
+          flutter-version: '3.27.4'
           channel: 'stable'
           cache: true
-          cache-key: flutter-3.24.5-stable
+          cache-key: flutter-3.27.4-stable
 
       - name: Setup Android SDK
         run: |
@@ -60,13 +60,11 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> $GITHUB_ENV
           echo "$ANDROID_SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_SDK/tools/bin" >> $GITHUB_PATH
 
-      - name: Accept Android licenses & install components
+      - name: Accept Android licenses
         run: |
           yes | sdkmanager --licenses 2>/dev/null || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>/dev/null || true
-          flutter doctor --android-licenses 2>/dev/null || true
 
       - name: Install Python dependencies
         run: pip install Pillow requests
@@ -74,139 +72,96 @@ jobs:
       - name: Generate Flutter WebView project
         run: |
           flutter create --org com.webview.app webview_app
-          cd webview_app
-          flutter pub add webview_flutter
+          cd webview_app && flutter pub add webview_flutter
 
-      - name: Inject WebView main.dart via Python
+      - name: Inject WebView main.dart
         env:
           WEB_URL: ${{ github.event.inputs.web_url }}
           APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
           python3 - << 'PYEOF'
 import os
-
-web_url = os.environ.get('WEB_URL', 'https://example.com')
+web_url  = os.environ.get('WEB_URL',  'https://example.com')
 app_name = os.environ.get('APP_NAME', 'MyWebApp') or 'MyWebApp'
-
 dart_code = """import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
-
-void main() {
-  runApp(const MyApp());
-}
-
+void main() { runApp(const MyApp()); }
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '""" + app_name + """',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: const WebViewPage(),
-    );
-  }
+  Widget build(BuildContext context) => MaterialApp(
+    title: '""" + app_name + """',
+    debugShowCheckedModeBanner: false,
+    theme: ThemeData(primarySwatch: Colors.blue),
+    home: const WebViewPage(),
+  );
 }
-
 class WebViewPage extends StatefulWidget {
   const WebViewPage({super.key});
-  @override
-  State<WebViewPage> createState() => _WebViewPageState();
+  @override State<WebViewPage> createState() => _WebViewPageState();
 }
-
 class _WebViewPageState extends State<WebViewPage> {
-  late final WebViewController _controller;
-  @override
-  void initState() {
+  late final WebViewController _c;
+  @override void initState() {
     super.initState();
-    _controller = WebViewController()
+    _c = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..loadRequest(Uri.parse('""" + web_url + """'));
   }
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: WebViewWidget(controller: _controller),
-    );
-  }
+  @override Widget build(BuildContext context) =>
+    Scaffold(body: WebViewWidget(controller: _c));
 }
 """
-
 with open('webview_app/lib/main.dart', 'w') as f:
     f.write(dart_code)
-print("main.dart generated:", app_name, "->", web_url)
+print("main.dart OK:", app_name, "->", web_url)
 PYEOF
 
-      - name: Set app name in pubspec.yaml
+      - name: Set app name & manifest
         env:
           APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
           APP="${APP_NAME:-MyWebApp}"
           sed -i "s/^name: .*/name: webview_app/" webview_app/pubspec.yaml
-          sed -i "s/^description: .*/description: $APP/" webview_app/pubspec.yaml
-
-      - name: Set app display name in AndroidManifest
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-        run: |
-          APP="${APP_NAME:-MyWebApp}"
           MANIFEST="webview_app/android/app/src/main/AndroidManifest.xml"
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP\"/" "$MANIFEST"
-          grep -q "INTERNET" "$MANIFEST" || sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\'$'\n    <application/' "$MANIFEST"
+          grep -q "INTERNET" "$MANIFEST" || \
+            sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\'$'\n    <application/' "$MANIFEST"
 
       - name: Write local.properties (WebView)
         run: |
+          FLUTTER_SDK=$(which flutter | sed 's|/bin/flutter||')
           echo "sdk.dir=$ANDROID_HOME" > webview_app/android/local.properties
-          echo "flutter.sdk=$(which flutter | sed 's|/bin/flutter||')" >> webview_app/android/local.properties
+          echo "flutter.sdk=$FLUTTER_SDK" >> webview_app/android/local.properties
 
       - name: Write gradle.properties (WebView)
         run: |
-          GRADLE_PROPS="webview_app/android/gradle.properties"
-          touch "$GRADLE_PROPS"
-          grep -q "org.gradle.jvmargs" "$GRADLE_PROPS" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GRADLE_PROPS"
-          grep -q "android.useAndroidX" "$GRADLE_PROPS" || echo "android.useAndroidX=true" >> "$GRADLE_PROPS"
-          grep -q "android.enableJetifier" "$GRADLE_PROPS" || echo "android.enableJetifier=true" >> "$GRADLE_PROPS"
+          GP="webview_app/android/gradle.properties"
+          touch "$GP"
+          grep -q "org.gradle.jvmargs"    "$GP" || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$GP"
+          grep -q "android.useAndroidX"   "$GP" || echo "android.useAndroidX=true"   >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
 
       - name: Download and set custom app icon
         env:
           ICON_URL: ${{ github.event.inputs.app_icon_url }}
         run: |
-          if [ -n "$ICON_URL" ]; then
-            python3 - << 'PYEOF'
-import os, sys, urllib.request
+          [ -z "$ICON_URL" ] && echo "No icon, skip" && exit 0
+          python3 - << 'PYEOF'
+import os, sys, urllib.request, io
 from PIL import Image
-import io
-
-icon_url = os.environ.get('ICON_URL', '')
-if not icon_url:
-    sys.exit(0)
-
-sizes = {
-    'mipmap-mdpi': 48,
-    'mipmap-hdpi': 72,
-    'mipmap-xhdpi': 96,
-    'mipmap-xxhdpi': 144,
-    'mipmap-xxxhdpi': 192,
-}
-
+icon_url = os.environ.get('ICON_URL','')
+if not icon_url: sys.exit(0)
+sizes = {'mipmap-mdpi':48,'mipmap-hdpi':72,'mipmap-xhdpi':96,'mipmap-xxhdpi':144,'mipmap-xxxhdpi':192}
 try:
-    req = urllib.request.urlopen(icon_url, timeout=30)
-    img_data = req.read()
-    img = Image.open(io.BytesIO(img_data)).convert('RGBA')
+    img = Image.open(io.BytesIO(urllib.request.urlopen(icon_url,timeout=30).read())).convert('RGBA')
     base = 'webview_app/android/app/src/main/res'
-    for folder, size in sizes.items():
-        out_dir = os.path.join(base, folder)
-        os.makedirs(out_dir, exist_ok=True)
-        resized = img.resize((size, size), Image.LANCZOS)
-        resized.save(os.path.join(out_dir, 'ic_launcher.png'), 'PNG')
-        print(f"Icon {size}x{size} -> {folder}")
-    print("Custom icon applied.")
-except Exception as e:
-    print(f"Warning icon: {e}, using default")
+    for folder,size in sizes.items():
+        d=os.path.join(base,folder); os.makedirs(d,exist_ok=True)
+        img.resize((size,size),Image.LANCZOS).save(os.path.join(d,'ic_launcher.png'),'PNG')
+        print(f"Icon {size}px -> {folder}")
+except Exception as e: print(f"Warning icon: {e}")
 PYEOF
-          else
-            echo "No icon URL provided, using default"
-          fi
 
       - name: Build APK (${{ github.event.inputs.build_mode }})
         working-directory: webview_app
@@ -214,14 +169,15 @@ PYEOF
         run: |
           BUILD_MODE="${{ github.event.inputs.build_mode }}"
           if [ "$BUILD_MODE" = "release" ]; then
-            flutter build apk --release --no-tree-shake-icons 2>&1 | tee /tmp/build.log
+            flutter build apk --release --no-tree-shake-icons --verbose 2>&1 | tee /tmp/wv_build.log
           else
-            flutter build apk --debug --no-tree-shake-icons 2>&1 | tee /tmp/build.log
+            flutter build apk --debug  --no-tree-shake-icons --verbose 2>&1 | tee /tmp/wv_build.log
           fi
-          BUILD_EXIT=${PIPESTATUS[0]}
-          if [ $BUILD_EXIT -ne 0 ]; then
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -ne 0 ]; then
             echo "=== BUILD GAGAL ==="
-            tail -30 /tmp/build.log
+            grep -E "(Error|error|Exception|FAILED)" /tmp/wv_build.log | tail -30 || true
+            tail -30 /tmp/wv_build.log
             exit 1
           fi
 
@@ -230,15 +186,11 @@ PYEOF
           APP_NAME: ${{ github.event.inputs.app_name }}
         run: |
           APK=$(find webview_app/build/app/outputs -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK tidak ditemukan"
-            find webview_app/build -type f | head -20
-            exit 1
-          fi
+          [ -z "$APK" ] && echo "ERROR: APK tidak ditemukan" && exit 1
           mkdir -p artifacts
           SAFE=$(echo "${APP_NAME:-webview}" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           cp "$APK" "artifacts/${SAFE}-${{ github.event.inputs.build_mode }}.apk"
-          echo "APK siap: $(du -sh artifacts/*.apk)"
+          echo "✅ APK: $(du -sh artifacts/*.apk)"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
